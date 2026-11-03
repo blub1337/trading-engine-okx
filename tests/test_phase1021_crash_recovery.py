@@ -915,21 +915,14 @@ def test_crash_restart_integration_applies_fill_once():
         signal_id="crash_restart_signal_001",
     )
 
-    # Monkeypatch record_execution to raise AFTER broker.place() returns
+    # Monkeypatch _update_portfolio_on_fill to raise AFTER broker.place() returns
     # but BEFORE the execution is finalized in the database.
-    original_record_execution = store1.record_execution
-    call_count = [0]
+    original_update_portfolio = engine1._update_portfolio_on_fill
 
-    def raising_record_execution(*args, **kwargs):
-        call_count[0] += 1
-        # First call: PENDING execution was already recorded before broker.place() - allow it.
-        # Second call: broker.place() returned successfully with FILLED result.
-        # Raise to simulate crash before engine finalizes execution.
-        if call_count[0] == 2:
-            raise RuntimeError("simulated crash before execution finalize")
-        return original_record_execution(*args, **kwargs)
+    def raising_update_portfolio(*args, **kwargs):
+        raise RuntimeError("simulated crash before execution finalize")
 
-    store1.record_execution = raising_record_execution
+    engine1._update_portfolio_on_fill = raising_update_portfolio
 
     try:
         engine1.process_signal(signal)
@@ -1331,5 +1324,346 @@ def test_signal_id_valid_accepted():
 
         # Warning not logged for valid signal_id
         # (execution proceeded without signal_id rejection)
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# Test G: TRUE LEGACY RECOVERY - FILLED execution with portfolio_applied=0
+# ---------------------------------------------------------------------------
+
+def test_legacy_recovery_filled_execution_portfolio_applied_zero():
+    """Test recovery of a FILLED execution that was never applied to portfolio.
+
+    This simulates a legacy scenario where:
+    - Execution was already marked FILLED in the database
+    - But portfolio_applied = 0 (crash after execution finalization, before portfolio update)
+    - Recovery must apply portfolio exactly once via _update_portfolio_on_fill
+    """
+    db_path = os.path.join(tempfile.mkdtemp(), "test_legacy_recovery.db")
+    store = SQLiteStore(db_path)
+    broker = PaperBroker(paper=True, store=store)
+    try:
+        # Setup: Create order intent, risk decision, and FILLED execution with portfolio_applied=0
+        intent = _make_intent("ORD-LEGACY-1")
+        intent_id = store.record_order_intent(intent)
+
+        risk_decision = _make_risk_decision(RiskStatus.APPROVED)
+        risk_id = store.record_risk_decision(intent_id, risk_decision)
+
+        # Insert FILLED execution directly with portfolio_applied=0 (simulating legacy state)
+        with store.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO executions (
+                    order_intent_id, risk_decision_id, status, adapter, order_id, filled,
+                    fail_reason, fill_price, fill_qty, fee, fee_bps, slippage_bps, portfolio_applied
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    intent_id, risk_id, "FILLED", "paper", "P123456789", 1,
+                    None, 50000.0, 0.02, 10.0, 10, 5,
+                ),
+            )
+
+        # Also create the corresponding paper order with correct client_order_id
+        order = _make_paper_order("ORD-LEGACY-1", status="FILLED")
+        # Create a new PaperOrder with the correct client_order_id since it's frozen
+        from trading_engine.models import PaperOrder
+        order = PaperOrder(
+            client_order_id="ORD-LEGACY-1",
+            asset=order.asset,
+            side=order.side,
+            notional=order.notional,
+            qty=order.qty,
+            limit=order.limit,
+            reference_price=order.reference_price,
+            fee_bps=order.fee_bps,
+            slippage_bps=order.slippage_bps,
+            status=order.status,
+            fill_price=order.fill_price,
+            fill_qty=order.fill_qty,
+            fee=order.fee,
+            broker_order_id=order.broker_order_id,
+            fail_reason=order.fail_reason,
+        )
+        store.save_paper_order(order)
+
+        store.update_cash(100000.0)
+
+        engine = _setup_engine_with_store(store, broker)
+
+        # Run recovery - should find FILLED execution with portfolio_applied=0 and apply it
+        stats = engine.recover_pending_executions()
+
+        assert stats["recovered_filled"] == 1, f"Expected 1 recovered_filled, got {stats}"
+        assert stats["errors"] == 0
+
+        # Verify portfolio was updated exactly once
+        portfolio = store.get_portfolio()
+        assert portfolio["cash"] < 100000.0, f"Portfolio must be updated: {portfolio['cash']}"
+
+        # Verify execution marked portfolio_applied = 1
+        conn = store._get_conn()
+        exec_row = conn.execute(
+            "SELECT portfolio_applied FROM executions WHERE order_intent_id = ?",
+            (intent_id,),
+        ).fetchone()
+        assert exec_row["portfolio_applied"] == 1, (
+            f"portfolio_applied must be 1, got {exec_row['portfolio_applied']}"
+        )
+
+        # Run recovery again - should not apply again (no pending executions with portfolio_applied=0)
+        cash_after_first = portfolio["cash"]
+        stats2 = engine.recover_pending_executions()
+        cash_after_second = store.get_portfolio()["cash"]
+        assert cash_after_first == cash_after_second, (
+            f"Portfolio changed on second recovery: {cash_after_first} -> {cash_after_second}"
+        )
+        # Second run finds no pending executions (portfolio_applied is now 1)
+        assert stats2["recovered_filled"] == 0
+        assert stats2["total_pending"] == 0
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# Test H: TRUE PARALLEL RECOVERY - Two threads, same execution
+# ---------------------------------------------------------------------------
+
+def test_true_parallel_recovery_same_execution():
+    """Two separate engine instances running recovery concurrently on same execution.
+
+    Uses two SQLiteStore instances and two TradingEngine instances in separate threads.
+    Both attempt to recover the same FILLED execution with portfolio_applied=0.
+    Result must be exactly one portfolio application.
+    """
+    import threading
+    import time
+
+    db_path = os.path.join(tempfile.mkdtemp(), "test_parallel_recovery.db")
+
+    # Initial setup - create the database state
+    store_setup = SQLiteStore(db_path)
+    broker_setup = PaperBroker(paper=True, store=store_setup)
+    try:
+        intent = _make_intent("ORD-PARALLEL")
+        intent_id = store_setup.record_order_intent(intent)
+
+        risk_decision = _make_risk_decision(RiskStatus.APPROVED)
+        risk_id = store_setup.record_risk_decision(intent_id, risk_decision)
+
+        # FILLED execution with portfolio_applied=0
+        with store_setup.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO executions (
+                    order_intent_id, risk_decision_id, status, adapter, order_id, filled,
+                    fail_reason, fill_price, fill_qty, fee, fee_bps, slippage_bps, portfolio_applied
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    intent_id, risk_id, "FILLED", "paper", "P123456789", 1,
+                    None, 50000.0, 0.02, 10.0, 10, 5,
+                ),
+            )
+
+        order = _make_paper_order("ORD-PARALLEL", status="FILLED")
+        # Create a new PaperOrder with the correct client_order_id since it's frozen
+        from trading_engine.models import PaperOrder
+        order = PaperOrder(
+            client_order_id="ORD-PARALLEL",
+            asset=order.asset,
+            side=order.side,
+            notional=order.notional,
+            qty=order.qty,
+            limit=order.limit,
+            reference_price=order.reference_price,
+            fee_bps=order.fee_bps,
+            slippage_bps=order.slippage_bps,
+            status=order.status,
+            fill_price=order.fill_price,
+            fill_qty=order.fill_qty,
+            fee=order.fee,
+            broker_order_id=order.broker_order_id,
+            fail_reason=order.fail_reason,
+        )
+        store_setup.save_paper_order(order)
+
+        store_setup.update_cash(100000.0)
+    finally:
+        store_setup.close()
+
+    results = []
+    errors = []
+
+    def run_recovery():
+        try:
+            store = SQLiteStore(db_path)
+            broker = PaperBroker(paper=True, store=store)
+            engine = _setup_engine_with_store(store, broker)
+            stats = engine.recover_pending_executions()
+            results.append(stats)
+            store.close()
+        except Exception as e:
+            errors.append(e)
+
+    # Start two threads concurrently
+    t1 = threading.Thread(target=run_recovery)
+    t2 = threading.Thread(target=run_recovery)
+
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    # Check for errors
+    assert len(errors) == 0, f"Recovery threads had errors: {errors}"
+
+    # Both threads should report success
+    assert len(results) == 2
+    total_recovered = sum(r["recovered_filled"] for r in results)
+    assert total_recovered == 1, f"Expected exactly 1 recovery total, got {total_recovered} (results: {results})"
+
+    # Verify final state
+    store_check = SQLiteStore(db_path)
+    try:
+        portfolio = store_check.get_portfolio()
+        assert portfolio["cash"] < 100000.0, f"Portfolio must be updated: {portfolio['cash']}"
+
+        conn = store_check._get_conn()
+        exec_row = conn.execute(
+            "SELECT portfolio_applied FROM executions WHERE order_intent_id = ?",
+            (intent_id,),
+        ).fetchone()
+        assert exec_row["portfolio_applied"] == 1, (
+            f"portfolio_applied must be 1, got {exec_row['portfolio_applied']}"
+        )
+    finally:
+        store_check.close()
+
+
+# ---------------------------------------------------------------------------
+# Test I: FINALIZE_EXECUTION ROLLBACK - Transaction failure during finalize
+# ---------------------------------------------------------------------------
+
+def test_finalize_execution_rollback_on_error():
+    """Test that finalize_execution() rolls back portfolio changes on failure.
+
+    This test injects a SQLite trigger that fires during finalize_execution()
+    when updating the executions table. The trigger raises an error, causing
+    the entire transaction (including portfolio changes) to roll back.
+    """
+    db_path = os.path.join(tempfile.mkdtemp(), "test_finalize_rollback.db")
+    store = SQLiteStore(db_path)
+    broker = PaperBroker(paper=True, store=store)
+    try:
+        intent = _make_intent("ORD-FINALIZE-ROLLBACK")
+        intent_id = store.record_order_intent(intent)
+
+        risk_decision = _make_risk_decision(RiskStatus.APPROVED)
+        risk_id = store.record_risk_decision(intent_id, risk_decision)
+
+        # Create PENDING execution
+        execution_id = store.record_execution(
+            intent_id, risk_id,
+            ExecutionResult(status="PENDING", adapter="paper", order_id=None, filled=False),
+        )
+
+        pending_order = _make_paper_order("ORD-FINALIZE-ROLLBACK", status="PENDING")
+        store.save_paper_order(pending_order)
+
+        store.update_paper_order_status(
+            "ORD-FINALIZE-ROLLBACK",
+            status="FILLED",
+            fill_price=50000.0,
+            fill_qty=0.02,
+            fee=10.0,
+            fee_bps=10,
+            slippage_bps=5,
+            broker_order_id="P123456789",
+        )
+
+        store.update_cash(100000.0)
+        store.update_position("BTC-USDT", qty=0.01, avg_entry_price=49000.0)
+        cash_before = store.get_portfolio()["cash"]
+        pos_before = store.get_position("BTC-USDT")
+
+        conn = store._get_conn()
+
+        # Create a trigger that fires on the executions UPDATE inside finalize_execution()
+        # This simulates a failure during the finalization step
+        # Note: SQLite triggers can't use parameters, so we hardcode the intent_id
+        conn.execute(f"""
+            CREATE TEMP TRIGGER fail_on_finalize_execution
+            BEFORE UPDATE ON executions
+            FOR EACH ROW
+            WHEN NEW.order_intent_id = {intent_id} AND NEW.status = 'FILLED'
+            BEGIN
+                SELECT RAISE(ABORT, "simulated finalize failure");
+            END
+        """)
+        conn.commit()
+
+        engine = _setup_engine_with_store(store, broker)
+
+        # Try to finalize the execution - should trigger the rollback
+        # We'll call _update_portfolio_on_fill which calls finalize_execution
+        existing_order = store.get_paper_order("ORD-FINALIZE-ROLLBACK")
+        signal_side = SignalSide(existing_order["side"])
+        intent_obj = OrderIntent(
+            client_order_id="ORD-FINALIZE-ROLLBACK",
+            asset=existing_order["asset"],
+            side=signal_side,
+            notional=existing_order["notional"],
+            qty=existing_order["qty"],
+            limit=existing_order["limit_price"],
+            meta={},
+        )
+        exec_result = ExecutionResult(
+            status="FILLED",
+            adapter="paper",
+            order_id="P123456789",
+            filled=True,
+            fail_reason=None,
+            fill_price=50000.0,
+            fill_qty=0.02,
+            fee=10.0,
+            fee_bps=10,
+            slippage_bps=5,
+            broker_order_id="P123456789",
+            client_order_id="ORD-FINALIZE-ROLLBACK",
+        )
+
+        try:
+            engine._update_portfolio_on_fill(intent_obj, exec_result, intent_id, risk_id, execution_id)
+            assert False, "Expected IntegrityError from trigger"
+        except (RuntimeError, sqlite3.IntegrityError) as e:
+            assert "simulated finalize failure" in str(e)
+
+        # Verify all state is unchanged after rollback
+        cash_after = store.get_portfolio()["cash"]
+        assert cash_after == cash_before, (
+            f"Portfolio cash must be unchanged after rollback: {cash_before} -> {cash_after}"
+        )
+
+        pos_after = store.get_position("BTC-USDT")
+        assert pos_before == pos_after, (
+            f"Position must be unchanged after rollback: {pos_before} -> {pos_after}"
+        )
+
+        # Execution must still be PENDING (never finalized)
+        exec_row = store.get_execution(intent_id)
+        assert exec_row is not None, "Execution row must exist"
+        assert exec_row["status"] == "PENDING", (
+            f"Execution must remain PENDING after rollback, got {exec_row['status']}"
+        )
+        assert exec_row["portfolio_applied"] == 0, (
+            "portfolio_applied must remain 0 after rollback"
+        )
+
+        # Clean up trigger
+        conn.execute("DROP TRIGGER IF EXISTS fail_on_finalize_execution")
+        conn.commit()
     finally:
         store.close()

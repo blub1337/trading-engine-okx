@@ -206,13 +206,23 @@ class SQLiteStore:
 
     @contextmanager
     def transaction(self):
-        """Explicit transaction context. Commits on success, rolls back on exception."""
+        """Explicit transaction context with BEGIN IMMEDIATE for write serialization.
+
+        Uses BEGIN IMMEDIATE to acquire a reserved lock immediately, preventing
+        other writers from starting transactions concurrently. This ensures
+        exactly-once semantics for portfolio updates.
+
+        Commits on success, rolls back on exception.
+        """
         conn = self._get_conn()
+        # Use BEGIN IMMEDIATE for write serialization
+        conn.execute("BEGIN IMMEDIATE")
         try:
             yield conn
             conn.commit()
         except Exception:
             conn.rollback()
+            raise
             raise
 
     # --- Signals ---
@@ -227,7 +237,7 @@ class SQLiteStore:
                 signal_id = hashlib.md5(
                     f"{signal.strategy}{signal.asset}{signal.side.value}{signal.issued_at.isoformat()}{signal.conf}".encode()
                 ).hexdigest()[:16]
-            
+
             try:
                 cur = conn.execute(
                     """
@@ -307,7 +317,7 @@ class SQLiteStore:
             signal_ref_id = None
             if hasattr(intent, 'signal_id') and intent.signal_id:
                 signal_ref_id = intent.signal_id
-            
+
             cur = conn.execute(
                 """
                 INSERT INTO order_intents (client_order_id, asset, side, notional, qty, limit_price, meta, signal_id, signal_ref_id)

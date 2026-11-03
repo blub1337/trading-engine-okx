@@ -228,17 +228,12 @@ class TradingEngine:
         # APPROVED -> paper execution ONLY.
         result = self.broker.place(intent, reference_price=reference_price)
         
-        # Update the execution record with final result
-        self.store.record_execution(intent_id, risk_id, result)
-
-        # Update portfolio on fill.
+        # Update portfolio and execution atomically
         if result.filled:
             self._update_portfolio_on_fill(intent, result, intent_id, risk_id, execution_id)
-            # Note: daily_start_equity should NOT be updated after fills.
-            # It represents the equity at the START of the trading day.
-            # current_equity is computed fresh at each signal for risk checks.
-            # Just persist the current daily_start_equity (unchanged).
             self.store.update_daily_loss_state(self._daily_start_equity, today.isoformat())
+        else:
+            self.store.record_execution(intent_id, risk_id, result)
 
         logger.info("Execution complete", extra={"status": result.status, "filled": result.filled})
         return result
@@ -335,19 +330,13 @@ class TradingEngine:
         )
 
     def _update_portfolio_on_fill(self, intent: OrderIntent, result: ExecutionResult, intent_id: Optional[int] = None, risk_id: Optional[int] = None, execution_id: Optional[int] = None) -> None:
-        """Update portfolio state after a fill. Uses atomic transaction.
+        """Update portfolio state after a fill. Uses atomic transaction with BEGIN IMMEDIATE.
         
         Deducts actual fill cost (fill_qty * fill_price) + fee from cash.
         Updates position quantity, average entry price, and realized P&L.
         All updates are performed in a single atomic transaction.
+        Exactly-once guarantee: portfolio_applied check and update happen within the same transaction.
         """
-        # Exactly-once guard: if portfolio already applied for this execution, skip
-        if intent_id is not None:
-            existing_exec = self.store.get_execution(intent_id)
-            if existing_exec and existing_exec.get("portfolio_applied", 0) == 1:
-                logger.info("Portfolio already applied for execution", extra={"intent_id": intent_id})
-                return
-
         # Use actual fill data from execution result
         if result.fill_qty is None or result.fill_price is None or result.fill_qty <= 0 or result.fill_price <= 0:
             logger.error("Invalid fill data in execution result", extra={
@@ -363,8 +352,32 @@ class TradingEngine:
         fill_cost = fill_qty * fill_price
         total_cash_out = fill_cost + fee
 
-        # Perform all updates in a single atomic transaction
+        # Perform all updates in a single atomic transaction with BEGIN IMMEDIATE for serialization
         with self.store.transaction() as conn:
+            # Exactly-once guard: check portfolio_applied WITHIN the transaction
+            if intent_id is not None:
+                existing_exec = conn.execute(
+                    "SELECT portfolio_applied FROM executions WHERE order_intent_id = ?",
+                    (intent_id,)
+                ).fetchone()
+                if existing_exec and existing_exec["portfolio_applied"] == 1:
+                    logger.info("Portfolio already applied for execution (inside transaction)", extra={"intent_id": intent_id})
+                    return
+
+            # Get current portfolio and position
+            portfolio_row = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()
+            if not portfolio_row:
+                raise RuntimeError("Portfolio state not found")
+            current_cash = portfolio_row["cash"]
+
+            # Deduct total cash out (fill cost + fee)
+            new_cash = current_cash - total_cash_out
+            if new_cash < 0:
+                raise RuntimeError(f"Insufficient cash: {current_cash} < {total_cash_out}")
+            conn.execute(
+                "UPDATE portfolio_state SET cash = ?, updated_at = ? WHERE id = 1",
+                (new_cash, _utc_now_iso())
+            )
             # Get current portfolio and position
             portfolio_row = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()
             if not portfolio_row:
@@ -487,7 +500,8 @@ class TradingEngine:
         """Recover pending executions after a crash/restart.
 
         Required behavior:
-        - Existing FILLED order: finalize the pending execution and apply the portfolio update exactly once.
+        - Existing FILLED order with portfolio_applied=0: finalize the pending execution and apply the portfolio update exactly once.
+        - Existing FILLED order with portfolio_applied=1: do not apply the fill again.
         - Existing REJECTED order: finalize without portfolio changes.
         - Existing PENDING order: leave it pending without generating a different ID.
         - No existing broker order: retry using the original client_order_id.
@@ -495,13 +509,14 @@ class TradingEngine:
         """
         logger.info("Starting PENDING execution recovery")
 
-        # Find all PENDING executions (these represent orders that were sent to broker
-        # but never finalized in the executions table)
+        # Find all PENDING executions AND FILLED executions with portfolio_applied=0
+        # (these represent orders that were sent to broker but never finalized in the executions table,
+        # or were finalized but portfolio was never applied due to crash)
         conn = self.store._get_conn()
         pending_executions = conn.execute(
             "SELECT e.*, oi.client_order_id FROM executions e "
             "JOIN order_intents oi ON e.order_intent_id = oi.id "
-            "WHERE e.status = 'PENDING' ORDER BY e.id"
+            "WHERE e.status = 'PENDING' OR (e.status = 'FILLED' AND e.portfolio_applied = 0) ORDER BY e.id"
         ).fetchall()
 
         stats = {
@@ -516,7 +531,9 @@ class TradingEngine:
             client_order_id = row["client_order_id"]
             intent_id = row["order_intent_id"]
             risk_id = row["risk_decision_id"]
-            logger.info(f"Recovering PENDING execution: {client_order_id}")
+            execution_id = row["id"]
+            portfolio_applied = row["portfolio_applied"] if "portfolio_applied" in row.keys() else 0
+            logger.info(f"Recovering execution: {client_order_id} (status={row['status']}, portfolio_applied={portfolio_applied})")
 
             try:
                 # Look up existing broker order via public broker API
@@ -532,12 +549,11 @@ class TradingEngine:
                     stats["errors"] += 1
                     continue
 
-                # Check if execution already finalized (idempotency)
-                existing_exec = self.store.get_execution(intent_id)
-                if existing_exec and existing_exec["status"] in ("FILLED", "REJECTED"):
-                    # Already finalized - check portfolio_applied marker
-                    if existing_exec["status"] == "FILLED" and existing_exec.get("portfolio_applied", 0) == 0:
-                        # Fill exists but portfolio not applied - apply now
+                # If execution already has a final status, check portfolio_applied
+                if row["status"] in ("FILLED", "REJECTED"):
+                    portfolio_applied_val = row["portfolio_applied"] if "portfolio_applied" in row.keys() else 0
+                    if row["status"] == "FILLED" and portfolio_applied_val == 0:
+                        # FILLED but portfolio not applied - apply now via atomic method
                         existing_order = self.store.get_paper_order(client_order_id)
                         if existing_order:
                             signal_side = SignalSide(existing_order["side"])
@@ -551,25 +567,29 @@ class TradingEngine:
                                 meta={},
                             )
                             exec_result = ExecutionResult(
-                                status=existing_exec["status"],
-                                adapter=existing_exec["adapter"],
-                                order_id=existing_exec["order_id"],
-                                filled=bool(existing_exec["filled"]),
-                                fail_reason=existing_exec["fail_reason"],
-                                fill_price=existing_exec.get("fill_price"),
-                                fill_qty=existing_exec.get("fill_qty"),
-                                fee=existing_exec.get("fee"),
-                                fee_bps=existing_exec.get("fee_bps"),
-                                slippage_bps=existing_exec.get("slippage_bps"),
-                                broker_order_id=existing_exec["order_id"],
+                                status=row["status"],
+                                adapter=row["adapter"],
+                                order_id=row["order_id"],
+                                filled=bool(row["filled"]),
+                                fail_reason=row["fail_reason"],
+                                fill_price=row["fill_price"] if "fill_price" in row.keys() else None,
+                                fill_qty=row["fill_qty"] if "fill_qty" in row.keys() else None,
+                                fee=row["fee"] if "fee" in row.keys() else None,
+                                fee_bps=row["fee_bps"] if "fee_bps" in row.keys() else None,
+                                slippage_bps=row["slippage_bps"] if "slippage_bps" in row.keys() else None,
+                                broker_order_id=row["order_id"],
                                 client_order_id=client_order_id,
                             )
-                            self._update_portfolio_on_fill(intent_obj, exec_result, intent_id, risk_id)
+                            self._update_portfolio_on_fill(intent_obj, exec_result, intent_id, risk_id, execution_id)
                             logger.info(f"Applied portfolio for already-finalized fill: {client_order_id}")
                         stats["recovered_filled"] += 1
                     else:
+                        # REJECTED or already applied FILLED
                         logger.info(f"Execution already finalized for {client_order_id}")
-                        stats["recovered_filled"] += 1
+                        if row["status"] == "FILLED":
+                            stats["recovered_filled"] += 1
+                        else:
+                            stats["recovered_rejected"] += 1
                     continue
 
                 if result is not None:

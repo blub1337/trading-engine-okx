@@ -132,7 +132,7 @@ def test_recovery_with_default_engine_restart():
     3. Default PaperBroker persists the fill.
     4. Inject failure after broker returns but before engine finalizes execution.
     5. Close the original engine.
-    6. Create a completely new TradingEngine with same DB path.
+    5. Create a completely new TradingEngine with same DB path.
     7. Do NOT manually replace its broker.
     8. Run recover_pending_executions().
     9. Verify the existing fill is recovered and applied exactly once.
@@ -192,21 +192,14 @@ def test_recovery_with_default_engine_restart():
         signal_id="crash_restart_default_001",
     )
 
-    # Monkeypatch record_execution to raise AFTER broker.place() returns
+    # Monkeypatch _update_portfolio_on_fill to raise AFTER broker.place() returns
     # but BEFORE the execution is finalized in the database.
-    original_record_execution = store1.record_execution
-    call_count = [0]
+    original_update_portfolio = engine1._update_portfolio_on_fill
 
-    def raising_record_execution(*args, **kwargs):
-        call_count[0] += 1
-        # First call: PENDING execution was already recorded before broker.place() - allow it.
-        # Second call: broker.place() returned successfully with FILLED result.
-        # Raise to simulate crash before engine finalizes execution.
-        if call_count[0] == 2:
-            raise RuntimeError("simulated crash before execution finalize")
-        return original_record_execution(*args, **kwargs)
+    def raising_update_portfolio(*args, **kwargs):
+        raise RuntimeError("simulated crash before execution finalize")
 
-    store1.record_execution = raising_record_execution
+    engine1._update_portfolio_on_fill = raising_update_portfolio
 
     try:
         engine1.process_signal(signal)
@@ -225,6 +218,7 @@ def test_recovery_with_default_engine_restart():
         # Find the signal by signal_id to get the order intent
         signal_row = store1_check.get_signal_by_signal_id("crash_restart_default_001")
         assert signal_row is not None, "Signal must exist after crash"
+        signal_row_id = signal_row["id"]
 
         # Find the order intent linked to this signal
         intent_row = store1_check.get_order_intent_by_signal_ref("crash_restart_default_001")
